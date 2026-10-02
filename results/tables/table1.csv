@@ -1,0 +1,6 @@
+level,default_top1,augmented_top1,augmented_top3,augmented_top5,augmented_top10
+bf16,59.8,64.8,84.2,88.8,91.5
+int8_ao,60.0,64.3,83.9,88.7,91.1
+nf4,57.7,63.0,84.2,88.9,92.3
+fp4,55.6,61.8,83.0,88.4,91.7
+nf4dq,57.9,63.2,84.0,88.9,92.1

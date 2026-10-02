@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use this code or these results, please cite the paper."
+title: "Post-training quantization effect on a reasoning language model for retrosynthesis"
+type: software
+authors:
+  - family-names: "Hussein"
+    given-names: "Abdulwahab"
+  - family-names: "Tetko"
+    given-names: "Igor V."
+license: MIT
+keywords:
+  - retrosynthesis
+  - post-training quantization
+  - reasoning language models
+  - inference efficiency
+  - reproducibility
+  - USPTO-50K
