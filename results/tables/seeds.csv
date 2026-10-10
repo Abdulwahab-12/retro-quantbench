@@ -1,0 +1,4 @@
+run,seed,n,top1,gained_vs_seed1234,lost_vs_seed1234,changed_vs_seed1234
+bf16,1234,5005,59.76,,,
+bf16.seed0695,695,5005,59.84,125,121,246
+bf16.seed1066,1066,5005,59.78,137,136,273

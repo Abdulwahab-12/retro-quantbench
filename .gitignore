@@ -1,0 +1,12 @@
+# container images and model weights
+*.sif
+*.safetensors
+
+# output of new runs
+run/results/
+run/power_*/
+
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store

@@ -1,0 +1,227 @@
+# ===========================================================================
+#  RetroDFM-R-8B with PyTorch, transformers, torchao and bitsandbytes.
+#
+#  Built by docker/build_images.sh, which passes the versions below as build
+#  arguments and converts the result to a Singularity image. The defaults are
+#  the same versions (build_images.sh --mslk). The weights are baked in, so the
+#  machine that runs the image needs no network.
+# ===========================================================================
+# CUDA_DISTRO is separate from CUDA_TAG because the two move independently:
+# CUDA 13 images are not published for ubuntu22.04, so a Blackwell build has to
+# change the distro as well as the version. Splitting them keeps "--cuda 13.2.1-cudnn"
+# meaning the same thing it always did.
+ARG CUDA_TAG=13.3.0-cudnn
+ARG CUDA_DISTRO=devel-ubuntu24.04
+FROM nvidia/cuda:${CUDA_TAG}-${CUDA_DISTRO}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    PATH=/opt/conda/envs/syn/bin:/opt/conda/bin:$PATH \
+    QB_HOME=/work \
+    QB_FORCE_ENV=syn \
+    TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential git curl ca-certificates libgomp1 unzip zip \
+        libxrender1 libxext6 libsm6 libx11-6 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Miniforge, not Miniconda: repo.anaconda.com returns HTTP 403 for
+# organisational use and this is a research institute.
+ARG PY_VER=3.12
+RUN curl -fsSL \
+      https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh \
+      -o /tmp/mc.sh \
+    && bash /tmp/mc.sh -b -p /opt/conda && rm /tmp/mc.sh \
+    && /opt/conda/bin/conda create -y -n syn "python=${PY_VER}" \
+    && /opt/conda/bin/conda clean -afy
+
+SHELL ["/bin/bash", "-lc"]
+
+# --------------------------------------------------------------- versions ---
+# Every version below is resolved HERE, during the build, on the machine that
+# has internet. The finished image carries the interpreter, torch, torchao,
+# bitsandbytes and every dependency inside it. The machine that RUNS the image
+# needs only a GPU driver and singularity -- no python, no pip, no network.
+#
+# The versions are pinned to the ones the results were produced with. The
+# literal word "latest" asks the index for its newest wheel instead. An empty
+# BNB_VER skips bitsandbytes.
+ARG TORCH_VER=2.13.0
+ARG TORCH_CUDA=cu132
+ARG TORCHAO_VER=0.18.0
+ARG BNB_VER=0.50.2
+# MSLK (Meta Superintelligence Labs Kernels, formerly FBGEMM GenAI) supplies the
+# CUTLASS/Triton kernels that torchao's int4-plain, fp8_w4a8 and dynamic NVFP4
+# paths import. Without it those three raise "Requires mslk >= 1.0.0" on ANY
+# card -- it is a packaging gap, not a hardware one.
+#
+# It is NOT on PyPI (the package of that name there is an empty 0.0.0 stub); it
+# ships on the PyTorch wheel index. Release 1.3.0 targets torch 2.13.x, CUDA
+# 13.0/13.2 and architectures 8.0/9.0a/10.0a/12.0a -- 12.0a is sm_120, i.e. the
+# RTX 5090 and RTX PRO 5000 Blackwell.
+ARG MSLK_VER=1.3.0
+
+# Resolve torch first and write the exact resolved version to a file. The last
+# step of the next layer reinstalls torch from the CUDA index, and it must ask
+# for the SAME version -- installing torchao or transformers can drag in the
+# default PyPI torch, which is the CPU build and would silently replace the
+# CUDA one.
+RUN set -e; \
+    case "${TORCH_VER}" in ""|latest) SPEC="torch" ;; *) SPEC="torch==${TORCH_VER}" ;; esac; \
+    echo "installing $SPEC from https://download.pytorch.org/whl/${TORCH_CUDA}"; \
+    pip install --no-cache-dir "$SPEC" \
+        --index-url "https://download.pytorch.org/whl/${TORCH_CUDA}"; \
+    python -c "import torch; print(torch.__version__)" > /opt/torch_resolved; \
+    echo "resolved torch: $(cat /opt/torch_resolved)"
+
+# transformers and accelerate were unpinned, which is how a rebuild months later
+# could silently install different versions from the ones that produced every
+# published number. Pin them; override at build time if you mean to change them.
+ARG TRANSFORMERS_VER=4.57.6
+ARG ACCELERATE_VER=1.10.1
+
+# WHERE TORCHAO COMES FROM, and why it is a separate switch.
+#
+# PyPI ships one generic torchao wheel. download.pytorch.org ships a wheel per
+# CUDA version (torchao-0.18.0+cu130). They are not the same binary: the CUDA
+# one carries kernels compiled against that CUDA, and the missing-operator
+# failures this project hit at 4 bit ("not available for build",
+# "NotImplementedError: Could not run torchao::...") are exactly the symptom of
+# a wheel whose kernels were never compiled in.
+#
+# Both images used here took torchao from the CUDA index, the build most
+# likely to have the 4-bit and FP4 operators. The resolved version string
+# records which one was used: the CUDA wheel reports 0.18.0+cu130, the PyPI
+# wheel reports 0.18.0.
+ARG TORCHAO_INDEX=cuda
+RUN set -e; \
+    case "${TORCHAO_VER}" in ""|latest) AO="torchao" ;; *) AO="torchao==${TORCHAO_VER}" ;; esac; \
+    pip install --no-cache-dir \
+        "transformers==${TRANSFORMERS_VER}" "accelerate==${ACCELERATE_VER}" \
+        safetensors sentencepiece protobuf rdkit numpy; \
+    case "${TORCHAO_INDEX}" in \
+      cuda) echo "torchao from the ${TORCH_CUDA} wheel index"; \
+            pip install --no-cache-dir "$AO" \
+              --index-url "https://download.pytorch.org/whl/${TORCH_CUDA}" \
+              --extra-index-url https://pypi.org/simple ;; \
+      *)    echo "torchao from PyPI"; pip install --no-cache-dir "$AO" ;; \
+    esac; \
+    case "${BNB_VER}" in \
+      ""|none|skip) echo "bitsandbytes not requested; NF4/FP4 unavailable" ;; \
+      latest)    pip install --no-cache-dir bitsandbytes \
+                 || echo "WARNING: bitsandbytes failed; NF4/FP4 unavailable" ;; \
+      *)         pip install --no-cache-dir "bitsandbytes==${BNB_VER}" \
+                 || echo "WARNING: bitsandbytes ${BNB_VER} failed; NF4/FP4 unavailable" ;; \
+    esac; \
+    case "${MSLK_VER}" in \
+      ""|none|skip) echo "MSLK not requested; int4-mslk, fp8_w4a8 and dynamic NVFP4 stay unavailable" ;; \
+      *) echo "installing MSLK (${MSLK_VER}) from the ${TORCH_CUDA} index"; \
+         if [ "${MSLK_VER}" = latest ]; then MS="mslk"; else MS="mslk==${MSLK_VER}"; fi; \
+         pip install --no-cache-dir "$MS" \
+             --index-url "https://download.pytorch.org/whl/${TORCH_CUDA}" \
+         || pip install --no-cache-dir "$MS" \
+             --index-url "https://download.pytorch.org/whl/cu130" \
+         || echo "WARNING: MSLK unavailable; those three levels will still fail" ;; \
+    esac; \
+    pip install --no-cache-dir --force-reinstall --no-deps \
+        "torch==$(cat /opt/torch_resolved)" \
+        --index-url "https://download.pytorch.org/whl/${TORCH_CUDA}"
+
+# ---------------------------------------------------------------- the model
+# Baked in, not downloaded: compute nodes have no internet, and a job that
+# fails on a download at hour six is the worst possible outcome.
+COPY model /opt/model/retrodfm-r-8b
+ENV QB_MODEL_DIR=/opt/model/retrodfm-r-8b
+
+COPY data /opt/qb/data
+COPY scripts /opt/qb/scripts
+COPY dist /opt/qb/dist
+ENV PYTHONPATH=/opt/qb
+
+# Fail the BUILD, not a cluster job, if anything is missing. Weights cannot be
+# loaded here (a build has no GPU), but the config, tokenizer and shard index
+# can be read, which catches a truncated or wrongly-copied model directory.
+RUN python - <<'PY'
+import glob, json, os, platform
+import torch, transformers, torchao
+from transformers import AutoConfig, AutoTokenizer
+print("torch", torch.__version__, "| transformers", transformers.__version__,
+      "| torchao", torchao.__version__)
+
+import torchao.quantization as Q
+need = ["int8_weight_only", "int8_dynamic_activation_int8_weight"]
+for n in need:
+    alt = "".join(p.title() for p in n.split("_")) + "Config"
+    assert hasattr(Q, n) or hasattr(Q, alt), f"torchao lacks {n}"
+print("torchao configs for int8 and W8A8 present")
+
+# Which quantization formats this particular build can even express. Reported,
+# not asserted: a missing format is a fact about the build worth recording, and
+# whether the GPU can execute it is a separate question the runtime probe asks.
+opt = ["int4_weight_only", "int8_dynamic_activation_int4_weight",
+       "int4_dynamic_activation_int4_weight", "float8_weight_only",
+       "float8_dynamic_activation_float8_weight", "nvfp4", "mxfp4"]
+have = []
+for n in opt:
+    alt = "".join(p.title() for p in n.split("_")) + "Config"
+    if hasattr(Q, n) or hasattr(Q, alt) or any(
+            a.lower().startswith(n.replace("_", "")) for a in dir(Q)):
+        have.append(n)
+print("torchao optional formats in this build:", ", ".join(have) or "none")
+try:
+    import mslk
+    print("mslk", getattr(mslk, "__version__", "?"), "-- int4-plain / fp8_w4a8 / NVFP4 dynamic enabled")
+    have.append("mslk")
+except Exception as e:
+    print("mslk NOT installed --", type(e).__name__,
+          "-- int4-plain, fp8_w4a8 and dynamic NVFP4 will fail")
+
+try:
+    import bitsandbytes as bnb
+    print("bitsandbytes", bnb.__version__, "-- NF4/FP4 available")
+    have.append("nf4/fp4 (bitsandbytes)")
+except Exception as e:
+    print("bitsandbytes NOT installed --", type(e).__name__, "-- NF4/FP4 unavailable")
+
+# Freeze what was resolved, inside the image, so a run on a machine with no
+# network can still answer "which versions produced these numbers".
+os.makedirs("/opt/qb", exist_ok=True)
+with open("/opt/qb/build-versions.json", "w") as fh:
+    json.dump({"python": platform.python_version(), "torch": torch.__version__,
+               "torch_cuda_build": torch.version.cuda,
+               "transformers": transformers.__version__,
+               "torchao": torchao.__version__,
+               "formats": have}, fh, indent=2)
+print(open("/opt/qb/build-versions.json").read())
+
+d = "/opt/model/retrodfm-r-8b"
+cfg = AutoConfig.from_pretrained(d)
+print("architecture:", getattr(cfg, "architectures", ["?"])[0])
+tok = AutoTokenizer.from_pretrained(d)
+print("tokenizer vocab:", len(tok))
+
+shards = sorted(glob.glob(os.path.join(d, "*.safetensors")))
+total = sum(os.path.getsize(p) for p in shards) / 1024**3
+print(f"weight shards: {len(shards)}  ({total:.1f} GB)")
+assert shards, "no *.safetensors in the model directory"
+idx = os.path.join(d, "model.safetensors.index.json")
+if os.path.exists(idx):
+    want = {v for v in json.load(open(idx))["weight_map"].values()}
+    have = {os.path.basename(p) for p in shards}
+    assert not (want - have), f"index references missing shards: {want - have}"
+    print("shard index complete")
+assert total > 10, f"only {total:.1f} GB of weights -- the copy looks truncated"
+print("model directory verified")
+PY
+
+# The complete dependency list, inside the image. Nothing here is ever consulted
+# at run time; it exists so the exact environment can be read back off a machine
+# with no network, and quoted in the paper.
+RUN pip freeze > /opt/qb/pip-freeze.txt \
+    && echo "recorded $(wc -l < /opt/qb/pip-freeze.txt) packages in /opt/qb/pip-freeze.txt"
+
+WORKDIR /work
+CMD ["bash", "/opt/qb/dist/run_llm_cluster.sh", "--help"]
